@@ -9,6 +9,8 @@
 //! The active implementation is determined by the `keyboard_implementation`
 //! setting and can be changed at runtime.
 
+#[cfg(target_os = "macos")]
+pub(crate) mod finish_and_send;
 mod handler;
 pub mod handy_keys;
 pub mod tauri_impl;
@@ -34,6 +36,10 @@ use crate::tray;
 /// Initialize shortcuts using the configured implementation
 pub fn init_shortcuts(app: &AppHandle) {
     let user_settings = settings::load_or_create_app_settings(app);
+    #[cfg(target_os = "macos")]
+    if user_settings.keyboard_implementation != KeyboardImplementation::None {
+        finish_and_send::init(app);
+    }
 
     // Check which implementation to use
     match user_settings.keyboard_implementation {
@@ -75,6 +81,8 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
     // switching implementations mid-recording cannot leave stale fallback state.
     crate::secure_input::register_cancel_fallback(app);
 
+    #[cfg(target_os = "macos")]
+    finish_and_send::set_recording(true);
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
     schedule_cancel_reconcile(app);
 }
@@ -83,6 +91,8 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
     crate::secure_input::unregister_cancel_fallback(app);
 
+    #[cfg(target_os = "macos")]
+    finish_and_send::set_recording(false);
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     schedule_cancel_reconcile(app);
 }

@@ -93,14 +93,36 @@ impl HandyPasteProvider {
     }
 }
 
+/// The app and recording that authorized an explicit Return after paste.
+pub(crate) struct SendTarget {
+    pub pid: i32,
+    pub session: u64,
+    pub cancel_generation: u64,
+}
+
+impl SendTarget {
+    fn is_current(&self, app: &AppHandle) -> bool {
+        crate::actions::is_current_recording_session(self.session)
+            && app
+                .try_state::<Arc<crate::managers::audio::AudioRecordingManager>>()
+                .is_some_and(|audio| !audio.was_cancelled_since(self.cancel_generation))
+            && crate::shortcut::finish_and_send::frontmost_pid() == Some(self.pid)
+    }
+}
+
+pub(crate) enum AfterPaste {
+    None,
+    AutoSubmit(AutoSubmitKey),
+    FinishAndSend(SendTarget),
+}
+
 struct MacPending {
     state: Arc<Mutex<TxState>>,
     saved_text: Option<String>,
     saved_image: Option<tauri::image::Image<'static>>,
     change_count: NSInteger,
     provider: Option<Retained<HandyPasteProvider>>,
-    auto_submit: bool,
-    auto_submit_key: AutoSubmitKey,
+    after_paste: AfterPaste,
     /// ClipboardHandling::CopyToClipboard — instead of restoring, settle by
     /// re-writing the transcript as plain text (without the concealment
     /// markers), so clipboard managers record it and it outlives the promise.
@@ -132,26 +154,41 @@ fn settle(
     }
     p.settled = true;
 
-    let (receipt_seen, ownership_lost) = match p.state.lock() {
-        Ok(st) => (st.any_receipt_after_injection(), st.ownership_lost),
-        Err(_) => (false, true),
+    let (receipt_seen, ownership_lost, injection_failed) = match p.state.lock() {
+        Ok(st) => (
+            st.any_receipt_after_injection(),
+            st.ownership_lost,
+            st.injection_failed,
+        ),
+        Err(_) => (false, true, true),
     };
 
     // Auto-submit only once the target demonstrably read the transcript;
     // pressing Enter after an unconfirmed paste could submit stale content.
-    if p.auto_submit && receipt_seen {
-        match enigo {
+    match &p.after_paste {
+        AfterPaste::FinishAndSend(target) => {
+            if receipt_seen && !ownership_lost && !injection_failed && target.is_current(app_handle)
+            {
+                if let Err(error) = crate::shortcut::finish_and_send::send_return(target.pid) {
+                    log::warn!("Could not submit dictation: {error}");
+                }
+            } else {
+                log::debug!("Skipped explicit submit after a lost target or unconfirmed paste");
+            }
+        }
+        AfterPaste::AutoSubmit(key) if receipt_seen => match enigo {
             Some(e) => {
-                let _ = send_return_key(e, p.auto_submit_key);
+                let _ = send_return_key(e, *key);
             }
             None => {
                 if let Some(enigo_state) = app_handle.try_state::<EnigoState>() {
                     if let Ok(mut e) = enigo_state.0.lock() {
-                        let _ = send_return_key(&mut e, p.auto_submit_key);
+                        let _ = send_return_key(&mut e, *key);
                     }
                 }
             }
-        }
+        },
+        _ => {}
     }
 
     let still_ours =
@@ -253,15 +290,21 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle) {
     });
 }
 
-pub(super) fn run(
+pub(crate) fn run(
     text: &str,
     app_handle: &AppHandle,
     paste_method: &PasteMethod,
     enigo: &mut enigo::Enigo,
-    auto_submit: bool,
-    auto_submit_key: AutoSubmitKey,
     clipboard_handling: ClipboardHandling,
+    after_paste: AfterPaste,
 ) -> Result<(), String> {
+    if let AfterPaste::FinishAndSend(target) = &after_paste {
+        if !target.is_current(app_handle) {
+            return Err("The app that requested finish and send is no longer focused".into());
+        }
+    }
+    let explicit_send = matches!(after_paste, AfterPaste::FinishAndSend(_));
+
     // Settle any previous transaction first so the snapshot below captures the
     // user's original clipboard, not the previous transcript.
     flush_pending(app_handle, enigo);
@@ -301,7 +344,8 @@ pub(super) fn run(
     if let Ok(mut st) = state.lock() {
         st.injected_at = Some(Instant::now());
     }
-    match send_chord(enigo, paste_method) {
+    let injection = send_chord(enigo, paste_method);
+    match &injection {
         Ok(()) => {
             info!("[reliable-paste] paste chord sent ({paste_method:?})");
         }
@@ -321,8 +365,7 @@ pub(super) fn run(
         saved_image,
         change_count,
         provider: Some(provider),
-        auto_submit,
-        auto_submit_key,
+        after_paste,
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
         transcript: text.to_string(),
         settled: false,
@@ -332,5 +375,9 @@ pub(super) fn run(
     }
     spawn_waiter(pending, app_handle.clone());
 
-    Ok(())
+    if explicit_send {
+        injection
+    } else {
+        Ok(())
+    }
 }

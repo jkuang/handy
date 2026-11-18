@@ -109,6 +109,11 @@ const POST_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// doesn't reset the tray or hide the overlay of a newer one.
 static RECORDING_SESSION: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "macos")]
+pub(crate) fn is_current_recording_session(session: u64) -> bool {
+    RECORDING_SESSION.load(Ordering::SeqCst) == session
+}
+
 /// Drop guard that finishes the transcription pipeline, including immediate
 /// model unloading on early exits.
 struct FinishGuard(AppHandle, Arc<TranscriptionManager>);
@@ -128,7 +133,7 @@ impl Drop for FinishGuard {
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
     fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, submit_to: Option<i32>);
 }
 
 // Transcribe Action
@@ -697,7 +702,9 @@ impl ShortcutAction for TranscribeAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str, submit_to: Option<i32>) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = submit_to;
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
@@ -913,46 +920,62 @@ impl ShortcutAction for TranscribeAction {
                                         // UI while this paste ran.
                                         let owns_ui =
                                             || RECORDING_SESSION.load(Ordering::SeqCst) == session;
-                                        let (outcome, notice) =
-                                            match utils::paste(final_text, ah_clone.clone()) {
-                                                Ok(utils::PasteOutcome::Pasted) => {
-                                                    debug!(
-                                                        "Text pasted successfully in {:?}",
-                                                        paste_time.elapsed()
+                                        #[cfg(target_os = "macos")]
+                                        let paste_result = if let Some(pid) = submit_to {
+                                            utils::paste_and_send(
+                                                final_text,
+                                                ah_clone.clone(),
+                                                crate::paste_tx::SendTarget {
+                                                    pid,
+                                                    session,
+                                                    cancel_generation,
+                                                },
+                                            )
+                                        } else {
+                                            utils::paste(final_text, ah_clone.clone())
+                                        };
+                                        #[cfg(not(target_os = "macos"))]
+                                        let paste_result =
+                                            utils::paste(final_text, ah_clone.clone());
+                                        let (outcome, notice) = match paste_result {
+                                            Ok(utils::PasteOutcome::Pasted) => {
+                                                debug!(
+                                                    "Text pasted successfully in {:?}",
+                                                    paste_time.elapsed()
+                                                );
+                                                // Leave a newer session's notice alone.
+                                                if owns_ui() {
+                                                    notices::clear(
+                                                        &ah_clone,
+                                                        NoticeSource::Dictation,
                                                     );
-                                                    // Leave a newer session's notice alone.
-                                                    if owns_ui() {
-                                                        notices::clear(
-                                                            &ah_clone,
-                                                            NoticeSource::Dictation,
-                                                        );
-                                                    }
-                                                    let notice = post_process_failed.then(|| {
-                                                        Notice::new(
-                                                            NoticeCode::PostProcessFailed,
-                                                            NoticeSource::Dictation,
-                                                        )
-                                                    });
-                                                    (TranscriptionOutcome::Typed, notice)
                                                 }
-                                                Ok(utils::PasteOutcome::Blocked) => (
+                                                let notice = post_process_failed.then(|| {
+                                                    Notice::new(
+                                                        NoticeCode::PostProcessFailed,
+                                                        NoticeSource::Dictation,
+                                                    )
+                                                });
+                                                (TranscriptionOutcome::Typed, notice)
+                                            }
+                                            Ok(utils::PasteOutcome::Blocked) => (
+                                                TranscriptionOutcome::Failed,
+                                                Some(Notice::new(
+                                                    NoticeCode::PasteBlockedElevated,
+                                                    NoticeSource::Dictation,
+                                                )),
+                                            ),
+                                            Err(e) => {
+                                                error!("Failed to paste transcription: {}", e);
+                                                (
                                                     TranscriptionOutcome::Failed,
                                                     Some(Notice::new(
-                                                        NoticeCode::PasteBlockedElevated,
+                                                        NoticeCode::PasteFailed,
                                                         NoticeSource::Dictation,
                                                     )),
-                                                ),
-                                                Err(e) => {
-                                                    error!("Failed to paste transcription: {}", e);
-                                                    (
-                                                        TranscriptionOutcome::Failed,
-                                                        Some(Notice::new(
-                                                            NoticeCode::PasteFailed,
-                                                            NoticeSource::Dictation,
-                                                        )),
-                                                    )
-                                                }
-                                            };
+                                                )
+                                            }
+                                        };
                                         match (owns_ui(), notice) {
                                             (true, Some(notice)) => {
                                                 notices::raise(&ah_clone, notice)
@@ -1058,7 +1081,13 @@ impl ShortcutAction for CancelAction {
         utils::cancel_current_operation(app);
     }
 
-    fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn stop(
+        &self,
+        _app: &AppHandle,
+        _binding_id: &str,
+        _shortcut_str: &str,
+        _submit_to: Option<i32>,
+    ) {
         // Nothing to do on stop for cancel
     }
 }
@@ -1076,7 +1105,7 @@ impl ShortcutAction for TestAction {
         );
     }
 
-    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str, _submit_to: Option<i32>) {
         log::info!(
             "Shortcut ID '{}': Stopped - {} (App: {})", // Changed "Released" to "Stopped" for consistency
             binding_id,
