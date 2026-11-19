@@ -38,12 +38,12 @@
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "macos")]
-use macos as platform;
+pub(crate) use macos::SendTarget;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
@@ -200,6 +200,21 @@ pub(crate) fn try_reliable_paste(
     auto_submit_key: crate::settings::AutoSubmitKey,
     clipboard_handling: crate::settings::ClipboardHandling,
 ) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return macos::run(
+        text,
+        app_handle,
+        paste_method,
+        enigo,
+        clipboard_handling,
+        if auto_submit {
+            macos::AfterPaste::AutoSubmit(auto_submit_key)
+        } else {
+            macos::AfterPaste::None
+        },
+    );
+
+    #[cfg(target_os = "windows")]
     platform::run(
         text,
         app_handle,

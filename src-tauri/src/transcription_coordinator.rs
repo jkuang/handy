@@ -201,13 +201,20 @@ enum Effect {
     Stop {
         binding_id: String,
         hotkey_string: String,
+        submit_to: Option<i32>,
     },
 }
 
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
-    Cancel { recording_was_active: bool },
+    #[cfg(target_os = "macos")]
+    FinishAndSend {
+        target_pid: i32,
+    },
+    Cancel {
+        recording_was_active: bool,
+    },
     ProcessingFinished,
 }
 
@@ -401,7 +408,11 @@ impl CoordinatorState {
                     // hold mode (the setting changed mid-recording) — otherwise
                     // nothing but Escape could stop it.
                     if self.is_locked() || input.mode == ShortcutActivation::Toggle {
-                        return Some(self.begin_processing(input.binding_id, input.hotkey_string));
+                        return Some(self.begin_processing(
+                            input.binding_id,
+                            input.hotkey_string,
+                            None,
+                        ));
                     }
                     // The key is still held (its release will end this
                     // recording), so a repeated press means nothing.
@@ -491,7 +502,7 @@ impl CoordinatorState {
             // stopping is the safe reading (it is what push-to-talk always did).
             .unwrap_or(Duration::MAX);
         if held >= threshold {
-            return Some(self.begin_processing(binding_id, hotkey_string));
+            return Some(self.begin_processing(binding_id, hotkey_string, None));
         }
         if let Some(hold) = &mut self.hold {
             debug!("Tap ({held:?}) for '{binding_id}': recording locked on until the next press");
@@ -557,12 +568,28 @@ impl CoordinatorState {
         }
     }
 
-    fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
+    #[cfg(target_os = "macos")]
+    fn finish_and_send(&mut self, target_pid: i32) -> Option<Effect> {
+        let Stage::Recording(binding_id) = &self.stage else {
+            return None;
+        };
+        let binding_id = binding_id.clone();
+        self.pending_release = None;
+        Some(self.begin_processing(binding_id, "enter".into(), Some(target_pid)))
+    }
+
+    fn begin_processing(
+        &mut self,
+        binding_id: String,
+        hotkey_string: String,
+        submit_to: Option<i32>,
+    ) -> Effect {
         self.stage = Stage::Processing;
         self.hold = None;
         Effect::Stop {
             binding_id,
             hotkey_string,
+            submit_to,
         }
     }
 }
@@ -620,6 +647,12 @@ impl TranscriptionCoordinator {
                             // tap into a hold (#2089).
                             let now = input.received_at;
                             if let Some(effect) = state.on_input(input, now) {
+                                run_effect(&app, &mut state, effect);
+                            }
+                        }
+                        #[cfg(target_os = "macos")]
+                        Command::FinishAndSend { target_pid } => {
+                            if let Some(effect) = state.finish_and_send(target_pid) {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
@@ -713,6 +746,13 @@ impl TranscriptionCoordinator {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn request_finish_and_send(&self, target_pid: i32) {
+        if self.tx.send(Command::FinishAndSend { target_pid }).is_err() {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+
     pub fn notify_cancel(&self, recording_was_active: bool) {
         if self
             .tx
@@ -747,8 +787,9 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
         Effect::Stop {
             binding_id,
             hotkey_string,
+            submit_to,
         } => {
-            stop(app, &binding_id, &hotkey_string);
+            stop(app, &binding_id, &hotkey_string, submit_to);
             emit_recording_phase(app, RecordingPhase::Stopped);
         }
     }
@@ -771,17 +812,65 @@ fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
     recording
 }
 
-fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
+fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str, submit_to: Option<i32>) {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.stop(app, binding_id, hotkey_string);
+    action.stop(app, binding_id, hotkey_string, submit_to);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn release_option(now: Instant) -> InputEvent {
+        InputEvent {
+            binding_id: "transcribe".into(),
+            hotkey_string: "option_right".into(),
+            is_pressed: false,
+            mode: ShortcutActivation::PushToTalk,
+            hold_threshold: Duration::ZERO,
+            external: false,
+            received_at: now,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finish_and_send_stops_once_before_the_option_release() {
+        for locked in [false, true] {
+            let mut state = CoordinatorState::new();
+            let now = Instant::now();
+            state.begin_recording("transcribe".into(), "option_right".into(), now, locked);
+            assert!(matches!(
+                state.finish_and_send(123),
+                Some(Effect::Stop {
+                    submit_to: Some(123),
+                    ..
+                })
+            ));
+            assert!(state.finish_and_send(123).is_none());
+            assert!(state.on_input(release_option(now), now).is_none());
+            assert!(state.on_processing_finished().is_none());
+            assert_eq!(state.stage, Stage::Idle);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finish_and_send_ignores_idle_and_clears_deferred_stop() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        assert!(state.finish_and_send(123).is_none());
+        state.begin_recording("transcribe".into(), "option_right".into(), now, false);
+        state.on_input(release_option(now), now);
+        assert!(state.grace_deadline().is_some());
+        assert!(state.finish_and_send(123).is_some());
+        assert!(state.on_grace_expired().is_none());
+        assert!(state.on_processing_finished().is_none());
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {

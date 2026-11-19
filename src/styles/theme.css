@@ -24,7 +24,11 @@
   --dark-color-warning: #fbbf24;
   --dark-color-error: #f87171;
 
-  /* Success. Pink already means "recording", so it gets its own hue. */
+  /* Recording is distinct from success and warning. */
+  --light-color-recording: #0f766e;
+  --dark-color-recording: #5eead4;
+
+  /* Success. */
   --light-color-moss: #2f7d5b;
   --dark-color-moss: #86c9a4;
 
@@ -132,6 +136,7 @@
   --color-text: var(--light-color-text);
   --color-background: var(--light-color-background);
   --color-logo-primary: var(--light-color-logo-primary);
+  --color-recording: var(--light-color-recording);
   --color-warning: var(--light-color-warning);
   --color-error: var(--light-color-error);
   --color-moss: var(--light-color-moss);
@@ -170,6 +175,7 @@
     --color-text: var(--dark-color-text);
     --color-background: var(--dark-color-background);
     --color-logo-primary: var(--dark-color-logo-primary);
+    --color-recording: var(--dark-color-recording);
     --color-warning: var(--dark-color-warning);
     --color-error: var(--dark-color-error);
     --color-moss: var(--dark-color-moss);
@@ -203,6 +209,7 @@
   --color-text: var(--light-color-text);
   --color-background: var(--light-color-background);
   --color-logo-primary: var(--light-color-logo-primary);
+  --color-recording: var(--light-color-recording);
   --color-warning: var(--light-color-warning);
   --color-error: var(--light-color-error);
   --color-moss: var(--light-color-moss);
@@ -222,6 +229,7 @@
 }
 
 :root[data-theme="dark"] {
+  --color-recording: var(--dark-color-recording);
   --color-text: var(--dark-color-text);
   --color-background: var(--dark-color-background);
   --color-logo-primary: var(--dark-color-logo-primary);

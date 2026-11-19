@@ -918,6 +918,43 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<PasteOutcome, String
     Ok(PasteOutcome::Blocked)
 }
 
+/// Explicitly finishing with Return uses the same clipboard receipt as reliable
+/// paste, even when normal dictation uses the legacy paste path.
+#[cfg(target_os = "macos")]
+pub(crate) fn paste_and_send(
+    text: String,
+    app_handle: AppHandle,
+    target: crate::paste_tx::SendTarget,
+) -> Result<PasteOutcome, String> {
+    let _paste = PASTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let settings = get_settings(&app_handle);
+    if settings.paste_method == PasteMethod::None {
+        return Err("Finish and send requires pasting to be enabled".into());
+    }
+    let text = with_trailing_space(text, settings.append_trailing_space);
+    let app = app_handle.clone();
+    // A clipboard receipt is required before sending Return. The explicit
+    // shortcut always uses the standard macOS paste chord for this reason.
+    with_enigo(&app_handle, move |enigo| {
+        crate::paste_tx::macos::run(
+            &text,
+            &app,
+            &PasteMethod::CtrlV,
+            enigo,
+            settings.clipboard_handling,
+            crate::paste_tx::macos::AfterPaste::FinishAndSend(target),
+        )
+    })?;
+    Ok(PasteOutcome::Pasted)
+}
+
+fn with_trailing_space(mut text: String, append: bool) -> String {
+    if append {
+        text.push(' ');
+    }
+    text
+}
+
 fn paste_as_configured(
     text: String,
     app_handle: AppHandle,
@@ -927,12 +964,7 @@ fn paste_as_configured(
     let paste_delay_ms = settings.paste_delay_ms;
     let paste_delay_after_ms = settings.paste_delay_after_ms;
 
-    // Append trailing space if setting is enabled
-    let text = if settings.append_trailing_space {
-        format!("{} ", text)
-    } else {
-        text
-    };
+    let text = with_trailing_space(text, settings.append_trailing_space);
 
     info!(
         "Using paste method: {:?}, delay before: {}ms, delay after: {}ms",
