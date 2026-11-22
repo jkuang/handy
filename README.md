@@ -1,5 +1,27 @@
 # Handy
 
+This fork adds three improvements to Handy on macOS.
+
+- **Return-to-send** finishes dictation, pastes the transcript, and presses Return in the app you were dictating into. The recording overlay uses a teal accent.
+- **Shorter start chime** plays a 185 ms version of the macOS Dictation cue.
+- The macOS installer waits for Handy to quit, verifies the new app, and saves the previous bundle for rollback.
+
+## Quick start for this fork
+
+On macOS, set up the [build prerequisites](BUILD.md#prerequisites), then run this from the repo:
+
+```sh
+./scripts/install-handy.sh
+```
+
+Allow microphone and Accessibility access when prompted, choose a transcription model, and use your dictation shortcut.
+
+---
+
+## Upstream README
+
+# Handy
+
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
 
 **A free, open source, and extensible speech-to-text application that works completely offline.**

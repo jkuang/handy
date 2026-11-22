@@ -1,5 +1,0 @@
-{
-  "productName": "Handy Send",
-  "identifier": "com.jkuang.handy.send",
-  "bundle": { "createUpdaterArtifacts": false }
-}
