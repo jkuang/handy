@@ -16,6 +16,7 @@ This guide covers how to set up the development environment and build Handy from
 
 - Xcode Command Line Tools
 - Install with: `xcode-select --install`
+- [CMake](https://cmake.org/download/) on `PATH` for the native transcription backend.
 
 #### Windows
 
@@ -129,6 +130,31 @@ sudo cp -a src-tauri/transcribe-libs/. /usr/lib/Handy/
 
 Resources only need re-copying if they change upstream (new icons, sounds, models, etc.).
 
+## Updating this fork on macOS
+
+With the macOS build prerequisites installed, build and install from this
+checkout in one command.
+
+```sh
+./scripts/install-handy.sh
+```
+
+Pass a checkout path after `--build` to build from that checkout. To install a
+prebuilt bundle from this fork, run `./scripts/install-handy.sh /path/to/Handy.app`.
+The installer verifies a staged copy, waits for Handy and its engine worker to
+exit, then swaps the app bundle in `/Applications`. It prints the path to the
+previous bundle and opens the new one. Pass the previous bundle to the same
+installer to roll back.
+
+When updating the earlier fork build with Return-to-send, use a checkout that
+includes that feature.
+
+The installer copies app data from `com.jkuang.handy.send` to `com.jkuang.handy`
+on the first update and keeps the original for rollback. Grant Microphone and
+Accessibility access if macOS asks. For subsequent builds, a consistent
+`APPLE_SIGNING_IDENTITY` can help preserve those grants.
+[Apple code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements/)
+
 ## Troubleshooting
 
 ### macOS Accessibility remains enabled after a local rebuild
@@ -141,8 +167,8 @@ After installing the final bundle at `/Applications/Handy.app`, quit Handy, clea
 stale Accessibility record, then reopen it:
 
 ```bash
-osascript -e 'tell application id "com.pais.handy" to quit' || true
-tccutil reset Accessibility com.pais.handy
+osascript -e 'tell application id "com.jkuang.handy" to quit' || true
+tccutil reset Accessibility com.jkuang.handy
 open /Applications/Handy.app
 ```
 
