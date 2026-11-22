@@ -77,22 +77,23 @@ static CANCEL_REGISTERED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Register the cancel shortcut (called when recording starts)
 pub fn register_cancel_shortcut(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    finish_and_send::set_recording(true);
+
     // Track recording lifecycle independently of the current implementation so
     // switching implementations mid-recording cannot leave stale fallback state.
     crate::secure_input::register_cancel_fallback(app);
 
-    #[cfg(target_os = "macos")]
-    finish_and_send::set_recording(true);
     CANCEL_REQUESTED.store(true, Ordering::SeqCst);
     schedule_cancel_reconcile(app);
 }
 
 /// Unregister the cancel shortcut (called when recording stops)
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
-    crate::secure_input::unregister_cancel_fallback(app);
-
     #[cfg(target_os = "macos")]
     finish_and_send::set_recording(false);
+
+    crate::secure_input::unregister_cancel_fallback(app);
     CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     schedule_cancel_reconcile(app);
 }

@@ -32,6 +32,15 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    #[cfg(target_os = "macos")]
+    if let Some(hotkey) = super::finish_and_send::FALLBACK_HOTKEYS
+        .iter()
+        .find(|hotkey| hotkey.id == binding_id)
+    {
+        hotkey.handle_event(app, is_pressed);
+        return;
+    }
+
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.

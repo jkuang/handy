@@ -15,6 +15,7 @@
 //!   not affected by secure input (modifier-only bindings need no fallback)
 //! - dynamically shadows the Cancel binding while recording, so Escape and
 //!   other keyed cancellation shortcuts remain available under secure input
+//! - registers Return and keypad Enter only when recording under secure input
 //! - exposes a count-only keyboard diagnostic for the debug window. Only
 //!   event *kinds* are counted — key identity is never logged or returned.
 
@@ -122,6 +123,7 @@ pub fn tray_warning_active(app: &AppHandle) -> bool {
 mod imp {
     use super::*;
     use crate::settings::{self, KeyboardImplementation, ShortcutBinding};
+    use crate::shortcut::finish_and_send::FALLBACK_HOTKEYS;
     use log::{debug, error, info, warn};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -316,6 +318,9 @@ mod imp {
                     }
                     *state.enabled_since.lock().unwrap() = Some(Instant::now());
                     *state.culprit.lock().unwrap() = culprit;
+                    if state.cancel_requested.load(Ordering::SeqCst) {
+                        reconcile_fallback(&app);
+                    }
                 }
 
                 if !now_enabled {
@@ -329,9 +334,9 @@ mod imp {
                         *state.culprit.lock().unwrap() = None;
                     }
 
-                    if state.sustained.swap(false, Ordering::SeqCst) {
+                    if state.sustained.swap(false, Ordering::SeqCst) || was_enabled {
                         reconcile_fallback(&app);
-                    } else if was_enabled || was_blocked {
+                    } else if was_blocked {
                         refresh_tray(&app);
                         emit_status(&app);
                     }
@@ -466,18 +471,20 @@ mod imp {
         };
 
         let settings = settings::get_settings(app);
-        let eligible = state.is_sustained()
-            && app
-                .try_state::<crate::commands::ShortcutsInitialized>()
-                .is_some()
+        let initialized = app
+            .try_state::<crate::commands::ShortcutsInitialized>()
+            .is_some();
+        let eligible = initialized
+            && state.is_sustained()
             && settings.keyboard_implementation == KeyboardImplementation::HandyKeys;
+        let recording = state.cancel_requested.load(Ordering::SeqCst);
 
         let mut next = FallbackState::default();
         let mut immune = 0usize;
         let mut wanted: Vec<(String, ShortcutBinding, bool)> = Vec::new();
         if eligible {
             for (id, binding) in &settings.bindings {
-                if id == "cancel" && !state.cancel_requested.load(Ordering::SeqCst) {
+                if id == "cancel" && !recording {
                     continue;
                 }
                 if id == "transcribe_with_post_process" && !settings.post_process_enabled {
@@ -490,6 +497,25 @@ mod imp {
                     ShadowPlan::Shadow { shadow, degraded } => {
                         wanted.push((id.clone(), shadow, degraded))
                     }
+                }
+            }
+        }
+        if initialized {
+            let capture_return = recording
+                && settings.keyboard_implementation != KeyboardImplementation::None
+                && is_enabled();
+            for hotkey in &FALLBACK_HOTKEYS {
+                // Keep a captured key registered through its release so a
+                // held Return cannot repeat into the target while it pastes.
+                if capture_return || hotkey.is_held() {
+                    let binding = ShortcutBinding {
+                        id: hotkey.id.into(),
+                        name: String::new(),
+                        description: String::new(),
+                        default_binding: hotkey.shortcut.into(),
+                        current_binding: hotkey.shortcut.into(),
+                    };
+                    wanted.push((binding.id.clone(), binding, false));
                 }
             }
         }
@@ -571,11 +597,7 @@ mod imp {
                 immune,
                 !next.degraded.is_empty() || !next.uncovered.is_empty()
             );
-        } else if state.is_sustained()
-            && app
-                .try_state::<crate::commands::ShortcutsInitialized>()
-                .is_none()
-        {
+        } else if state.is_sustained() && !initialized {
             debug!("SecureInput fallback deferred until shortcuts are initialized");
         }
 
@@ -599,11 +621,8 @@ mod imp {
     pub fn register_cancel_fallback(app: &AppHandle) {
         let state = app.state::<SecureInputState>();
         state.cancel_requested.store(true, Ordering::SeqCst);
-        // Without sustained Secure Input there are no Carbon shadows to
-        // update. The monitor performs reconciliation when sustained mode is
-        // entered or left, so spawning here would only race the normal tray
-        // state transition for every recording start.
-        if state.is_sustained() {
+        // Return needs to work even during a brief password field focus.
+        if is_enabled() {
             schedule_reconcile(app);
         }
     }
@@ -611,9 +630,8 @@ mod imp {
     pub fn unregister_cancel_fallback(app: &AppHandle) {
         let state = app.state::<SecureInputState>();
         state.cancel_requested.store(false, Ordering::SeqCst);
-        if state.is_sustained() {
-            schedule_reconcile(app);
-        }
+        // Secure Input can clear before the monitor notices it was enabled.
+        schedule_reconcile(app);
     }
 
     /// Count-only capture test for the debug window. Opens a short-lived
