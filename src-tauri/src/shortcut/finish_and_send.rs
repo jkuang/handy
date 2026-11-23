@@ -19,6 +19,45 @@ const KEYPAD_ENTER: u16 = 76;
 const SUBMIT_EVENT_MARKER: i64 = 0x4841_4e44_5953_454e;
 static RECORDING: AtomicBool = AtomicBool::new(false);
 
+pub(crate) struct FallbackHotkey {
+    pub(crate) id: &'static str,
+    pub(crate) shortcut: &'static str,
+    held: AtomicBool,
+}
+
+impl FallbackHotkey {
+    const fn new(id: &'static str, shortcut: &'static str) -> Self {
+        Self {
+            id,
+            shortcut,
+            held: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn handle_event(&self, app: &AppHandle, pressed: bool) {
+        let was_held = self.held.swap(pressed, Ordering::SeqCst);
+        if pressed && !was_held && RECORDING.swap(false, Ordering::SeqCst) {
+            request_send(app);
+        } else if !pressed && was_held {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::secure_input::reconcile_fallback(&app);
+            });
+        }
+    }
+}
+
+pub(crate) static FALLBACK_HOTKEYS: [FallbackHotkey; 4] = [
+    FallbackHotkey::new("finish_and_send_return", "Enter"),
+    FallbackHotkey::new("finish_and_send_keypad_enter", "NumpadEnter"),
+    FallbackHotkey::new("finish_and_send_option_return", "Alt+Enter"),
+    FallbackHotkey::new("finish_and_send_option_keypad_enter", "Alt+NumpadEnter"),
+];
+
 struct Context {
     app: AppHandle,
     tap: Cell<Option<NonNull<CFMachPort>>>,
@@ -51,6 +90,13 @@ pub(crate) fn frontmost_pid() -> Option<i32> {
         .frontmostApplication()
         .map(|app| app.processIdentifier())
         .filter(|pid| *pid > 0)
+}
+
+fn request_send(app: &AppHandle) {
+    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+        // PID zero will fail the focus check and prevent an accidental submit.
+        coordinator.request_finish_and_send(frontmost_pid().unwrap_or(0));
+    }
 }
 
 pub(crate) fn send_return(pid: i32) -> Result<(), String> {
@@ -123,10 +169,7 @@ unsafe extern "C-unwind" fn on_event(
     // Swallow the user's press even if the target disappeared. Forwarding it
     // could send whatever text happened to be in the input before dictation.
     context.swallowed.set(Some(key));
-    if let Some(coordinator) = context.app.try_state::<TranscriptionCoordinator>() {
-        // PID zero will fail the focus check and prevent an accidental submit.
-        coordinator.request_finish_and_send(frontmost_pid().unwrap_or(0));
-    }
+    request_send(&context.app);
     std::ptr::null_mut()
 }
 
@@ -176,5 +219,27 @@ pub(super) fn init(app: &AppHandle) {
         });
     }) {
         log::warn!("Could not initialize the finish and send shortcut: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FALLBACK_HOTKEYS;
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+
+    #[test]
+    fn finish_and_send_fallback_matches_return_with_or_without_option() {
+        let shortcuts = FALLBACK_HOTKEYS
+            .each_ref()
+            .map(|hotkey| hotkey.shortcut.parse::<Shortcut>().unwrap());
+        assert_eq!(
+            shortcuts,
+            [
+                Shortcut::new(None, Code::Enter),
+                Shortcut::new(None, Code::NumpadEnter),
+                Shortcut::new(Some(Modifiers::ALT), Code::Enter),
+                Shortcut::new(Some(Modifiers::ALT), Code::NumpadEnter),
+            ]
+        );
     }
 }
