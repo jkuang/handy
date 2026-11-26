@@ -27,6 +27,9 @@
 //! polled from a dedicated recording thread. Events are emitted to the frontend
 //! via Tauri's event system.
 
+#[cfg(target_os = "macos")]
+mod macos_modifiers;
+
 use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyboardListener};
 use log::{debug, error, info};
 use serde::Serialize;
@@ -119,6 +122,14 @@ impl HandyKeysState {
         let mut binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
         let mut hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
 
+        #[cfg(target_os = "macos")]
+        let modifier_tap = macos_modifiers::ModifierTap::new().or_else(|| {
+            log::warn!(
+                "Modifier event tap unavailable; using handy-keys for modifier-only shortcuts"
+            );
+            None
+        });
+
         loop {
             // Check for hotkey events (non-blocking)
             while let Some(event) = manager.try_recv() {
@@ -133,7 +144,18 @@ impl HandyKeysState {
             }
 
             // Check for commands (non-blocking with timeout)
-            match cmd_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            let timeout = std::time::Duration::from_millis(10);
+            #[cfg(target_os = "macos")]
+            let timeout = if let Some(tap) = &modifier_tap {
+                for (id, shortcut, pressed) in tap.poll(timeout) {
+                    debug!("Modifier shortcut {id} ({shortcut}), pressed={pressed}");
+                    handle_shortcut_event(&app, &id, &shortcut, pressed);
+                }
+                std::time::Duration::ZERO
+            } else {
+                timeout
+            };
+            match cmd_rx.recv_timeout(timeout) {
                 Ok(cmd) => match cmd {
                     ManagerCommand::Register {
                         binding_id,
@@ -142,6 +164,8 @@ impl HandyKeysState {
                     } => {
                         let result = Self::do_register(
                             &manager,
+                            #[cfg(target_os = "macos")]
+                            modifier_tap.as_ref(),
                             &mut binding_to_hotkey,
                             &mut hotkey_to_binding,
                             &binding_id,
@@ -155,6 +179,8 @@ impl HandyKeysState {
                     } => {
                         let result = Self::do_unregister(
                             &manager,
+                            #[cfg(target_os = "macos")]
+                            modifier_tap.as_ref(),
                             &mut binding_to_hotkey,
                             &mut hotkey_to_binding,
                             &binding_id,
@@ -182,6 +208,7 @@ impl HandyKeysState {
     /// Register a hotkey
     fn do_register(
         manager: &HotkeyManager,
+        #[cfg(target_os = "macos")] modifier_tap: Option<&macos_modifiers::ModifierTap>,
         binding_to_hotkey: &mut HashMap<String, HotkeyId>,
         hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
         binding_id: &str,
@@ -191,6 +218,10 @@ impl HandyKeysState {
             .parse()
             .map_err(|e| format!("Failed to parse hotkey '{}': {}", hotkey_string, e))?;
 
+        #[cfg(target_os = "macos")]
+        if let Some(tap) = modifier_tap.filter(|_| hotkey.key.is_none()) {
+            return tap.register(hotkey.modifiers, binding_id, hotkey_string);
+        }
         let id = manager
             .register(hotkey)
             .map_err(|e| format!("Failed to register hotkey: {}", e))?;
@@ -208,10 +239,15 @@ impl HandyKeysState {
     /// Unregister a hotkey
     fn do_unregister(
         manager: &HotkeyManager,
+        #[cfg(target_os = "macos")] modifier_tap: Option<&macos_modifiers::ModifierTap>,
         binding_to_hotkey: &mut HashMap<String, HotkeyId>,
         hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
         binding_id: &str,
     ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if let Some(tap) = modifier_tap {
+            tap.unregister(binding_id);
+        }
         if let Some(id) = binding_to_hotkey.remove(binding_id) {
             manager
                 .unregister(id)
