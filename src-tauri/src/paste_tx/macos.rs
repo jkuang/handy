@@ -12,18 +12,22 @@
 //! run loop. The (potentially seconds-long) wait runs on a worker thread; the
 //! guarded restore is dispatched back to the main thread.
 
+mod verified_edit;
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use log::{error, info};
+use dispatch2::MainThreadBound;
+use log::{debug, error, info};
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
 use objc2_foundation::{NSArray, NSInteger, NSObject, NSString};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+use self::verified_edit::ExpectedEdit;
 use super::{evaluate, send_chord, TxState, WaitDecision};
 use crate::clipboard::send_return_key;
 use crate::input::EnigoState;
@@ -63,18 +67,17 @@ define_class!(
             // Only a text read counts as a receipt: a request for one of the
             // concealment marker types is a clipboard manager inspecting the
             // markers, not the paste target reading the transcript.
-            if is_text {
-                if let Ok(mut state) = ivars.state.lock() {
-                    state.record_receipt(Instant::now());
-                }
-            }
+            let requested_at = Instant::now();
             let payload = if is_text {
                 NSString::from_str(&ivars.text)
             } else {
-                // Concealment marker types are never handed out.
                 NSString::from_str("")
             };
-            let _ = pasteboard.setString_forType(&payload, data_type);
+            if pasteboard.setString_forType(&payload, data_type) && is_text {
+                if let Ok(mut state) = ivars.state.lock() {
+                    state.record_receipt(requested_at);
+                }
+            }
         }
 
         #[unsafe(method(pasteboardChangedOwner:))]
@@ -116,6 +119,44 @@ pub(crate) enum AfterPaste {
     FinishAndSend(SendTarget),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SubmitTiming {
+    VerifiedEdit,
+    Settlement,
+}
+
+impl AfterPaste {
+    /// Remove the one pending Return. An inconclusive early check leaves it
+    /// for settlement; a known focus change disarms it altogether.
+    fn claim_return(
+        &mut self,
+        timing: SubmitTiming,
+        same_focus: Option<bool>,
+        visible: bool,
+    ) -> Option<i32> {
+        let Self::FinishAndSend(target) = self else {
+            return None;
+        };
+        let pid = target.pid;
+        if same_focus == Some(false) {
+            *self = Self::None;
+            return None;
+        }
+        if timing == SubmitTiming::VerifiedEdit && !(same_focus == Some(true) && visible) {
+            return None;
+        }
+        *self = Self::None;
+        Some(pid)
+    }
+}
+
+fn submit_receipt(st: &TxState) -> Option<(Instant, Instant)> {
+    if st.ownership_lost || st.injection_failed || st.cancelled {
+        return None;
+    }
+    Some((st.injected_at?, st.last_receipt_after_injection()?))
+}
+
 struct MacPending {
     state: Arc<Mutex<TxState>>,
     saved_text: Option<String>,
@@ -123,6 +164,7 @@ struct MacPending {
     change_count: NSInteger,
     provider: Option<Retained<HandyPasteProvider>>,
     after_paste: AfterPaste,
+    edit: Option<MainThreadBound<ExpectedEdit>>,
     /// ClipboardHandling::CopyToClipboard — instead of restoring, settle by
     /// re-writing the transcript as plain text (without the concealment
     /// markers), so clipboard managers record it and it outlives the promise.
@@ -130,6 +172,47 @@ struct MacPending {
     /// The transcript, for the `preserve_transcript` re-write at settle time.
     transcript: String,
     settled: bool,
+}
+
+impl MacPending {
+    /// Called on the main thread after edit verification or during settlement.
+    /// Taking the target makes either path the only one that can post Return.
+    fn finish_and_send(&mut self, app: &AppHandle, timing: SubmitTiming) {
+        let AfterPaste::FinishAndSend(target) = &self.after_paste else {
+            return;
+        };
+        let receipt = self.state.lock().ok().and_then(|st| submit_receipt(&st));
+        let Some((injected, read)) = receipt else {
+            return;
+        };
+        if !target.is_current(app) {
+            return;
+        }
+        let edit = MainThreadMarker::new().and_then(|main| self.edit.as_ref().map(|e| e.get(main)));
+        let (path, visible) = match timing {
+            SubmitTiming::VerifiedEdit => {
+                ("verified edit", edit.is_some_and(ExpectedEdit::is_visible))
+            }
+            SubmitTiming::Settlement => ("settlement", false),
+        };
+        // Recheck after the cross-process read. A different control in the
+        // same frontmost application must not receive the original Return.
+        let same_focus = edit.and_then(ExpectedEdit::same_focus);
+        if NSPasteboard::generalPasteboard().changeCount() != self.change_count
+            || !target.is_current(app)
+        {
+            debug!("Skipped explicit submit after the clipboard or target changed");
+            return;
+        }
+        let Some(pid) = self.after_paste.claim_return(timing, same_focus, visible) else {
+            return;
+        };
+        match crate::shortcut::finish_and_send::send_return(pid) {
+            Ok(()) => debug!("[finish-and-send] posted Return via {path}, {}ms after chord, {}ms after last read",
+                injected.elapsed().as_millis(), read.elapsed().as_millis()),
+            Err(error) => log::warn!("Could not submit dictation: {error}"),
+        }
+    }
 }
 
 /// The transaction currently holding the clipboard, if any. A new paste
@@ -154,28 +237,13 @@ fn settle(
     }
     p.settled = true;
 
-    let (receipt_seen, ownership_lost, injection_failed) = match p.state.lock() {
-        Ok(st) => (
-            st.any_receipt_after_injection(),
-            st.ownership_lost,
-            st.injection_failed,
-        ),
-        Err(_) => (false, true, true),
+    let (receipt_seen, ownership_lost) = match p.state.lock() {
+        Ok(st) => (st.any_receipt_after_injection(), st.ownership_lost),
+        Err(_) => (false, true),
     };
 
-    // Auto-submit only once the target demonstrably read the transcript;
-    // pressing Enter after an unconfirmed paste could submit stale content.
+    p.finish_and_send(app_handle, SubmitTiming::Settlement);
     match &p.after_paste {
-        AfterPaste::FinishAndSend(target) => {
-            if receipt_seen && !ownership_lost && !injection_failed && target.is_current(app_handle)
-            {
-                if let Err(error) = crate::shortcut::finish_and_send::send_return(target.pid) {
-                    log::warn!("Could not submit dictation: {error}");
-                }
-            } else {
-                log::debug!("Skipped explicit submit after a lost target or unconfirmed paste");
-            }
-        }
         AfterPaste::AutoSubmit(key) if receipt_seen => match enigo {
             Some(e) => {
                 let _ = send_return_key(e, *key);
@@ -230,7 +298,7 @@ fn flush_pending(app_handle: &AppHandle, enigo: &mut enigo::Enigo) {
     }
 }
 
-fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle) {
+fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle, mut check_edit: bool) {
     thread::spawn(move || {
         let outcome = loop {
             thread::sleep(Duration::from_millis(15));
@@ -259,6 +327,20 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle) {
             };
             if let WaitDecision::Finish = decision {
                 break state_snapshot;
+            }
+            // One opportunity after the first receipt. Slow editors and fields
+            // that transform the paste continue through normal settlement.
+            if check_edit && state_snapshot == (true, false, false) {
+                check_edit = false;
+                let pending = pending.clone();
+                let app = app_handle.clone();
+                let _ = app_handle.run_on_main_thread(move || {
+                    if let Ok(mut p) = pending.lock() {
+                        if !p.settled {
+                            p.finish_and_send(&app, SubmitTiming::VerifiedEdit);
+                        }
+                    }
+                });
             }
         };
 
@@ -330,6 +412,19 @@ pub(crate) fn run(
     }
     let types = NSArray::from_retained_slice(&types);
 
+    let edit = match (&after_paste, MainThreadMarker::new()) {
+        (AfterPaste::FinishAndSend(target), Some(main)) => {
+            ExpectedEdit::capture(target.pid, text).map(|edit| MainThreadBound::new(edit, main))
+        }
+        _ => None,
+    };
+
+    if let AfterPaste::FinishAndSend(target) = &after_paste {
+        if !target.is_current(app_handle) {
+            return Err("The dictation target changed before paste".into());
+        }
+    }
+
     // declareTypes:owner: clears the pasteboard and puts our promise on it;
     // the return value is the new changeCount.
     let change_count: NSInteger =
@@ -359,6 +454,7 @@ pub(crate) fn run(
         }
     }
 
+    let check_edit = edit.is_some();
     let pending = Arc::new(Mutex::new(MacPending {
         state,
         saved_text,
@@ -366,6 +462,7 @@ pub(crate) fn run(
         change_count,
         provider: Some(provider),
         after_paste,
+        edit,
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
         transcript: text.to_string(),
         settled: false,
@@ -373,11 +470,85 @@ pub(crate) fn run(
     if let Ok(mut slot) = PENDING.lock() {
         *slot = Some(pending.clone());
     }
-    spawn_waiter(pending, app_handle.clone());
+    spawn_waiter(pending, app_handle.clone(), check_edit);
 
     if explicit_send {
         injection
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use SubmitTiming::{Settlement, VerifiedEdit};
+
+    fn pending_return() -> AfterPaste {
+        AfterPaste::FinishAndSend(SendTarget {
+            pid: 42,
+            session: 1,
+            cancel_generation: 0,
+        })
+    }
+
+    #[test]
+    fn verified_edit_can_send_before_restoration_and_only_once() {
+        let start = Instant::now();
+        let mut tx = TxState::new();
+        tx.injected_at = Some(start);
+        let read = start + Duration::from_millis(107);
+        tx.record_receipt(read);
+        let check = read + Duration::from_millis(15);
+        assert!(submit_receipt(&tx).is_some());
+        assert!(matches!(evaluate(&tx, check), WaitDecision::KeepWaiting));
+        let mut action = pending_return();
+        assert_eq!(
+            action.claim_return(VerifiedEdit, Some(true), true),
+            Some(42)
+        );
+        assert!(matches!(
+            evaluate(&tx, read + super::super::QUIET_PERIOD),
+            WaitDecision::Finish
+        ));
+        assert_eq!(action.claim_return(Settlement, Some(true), false), None);
+    }
+
+    #[test]
+    fn inconclusive_checks_leave_one_return_for_settlement() {
+        for (focus, visible) in [(None, false), (None, true), (Some(true), false)] {
+            let mut action = pending_return();
+            assert_eq!(action.claim_return(VerifiedEdit, focus, visible), None);
+            assert_eq!(action.claim_return(Settlement, focus, false), Some(42));
+            assert_eq!(action.claim_return(VerifiedEdit, Some(true), true), None);
+        }
+    }
+
+    #[test]
+    fn changing_field_even_within_the_same_app_disarms_return() {
+        for timing in [VerifiedEdit, Settlement] {
+            let mut action = pending_return();
+            assert_eq!(action.claim_return(timing, Some(false), true), None);
+            assert_eq!(action.claim_return(Settlement, Some(true), false), None);
+        }
+    }
+
+    #[test]
+    fn failed_cancelled_or_unconfirmed_pastes_cannot_submit() {
+        let mut tx = TxState::new();
+        tx.record_receipt(Instant::now());
+        tx.injected_at = Some(Instant::now() + Duration::from_millis(1));
+        assert!(submit_receipt(&tx).is_none());
+        tx.record_receipt(tx.injected_at.unwrap());
+        for (failed, lost, cancelled) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            tx.injection_failed = failed;
+            tx.ownership_lost = lost;
+            tx.cancelled = cancelled;
+            assert!(submit_receipt(&tx).is_none());
+        }
     }
 }
