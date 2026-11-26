@@ -855,8 +855,8 @@ pub fn run(cli_args: CliArgs) {
         .plugin(
             LogBuilder::new()
                 .level(log::LevelFilter::Trace) // Set to most verbose level globally
-                .max_file_size(500_000)
-                .rotation_strategy(RotationStrategy::KeepOne)
+                .max_file_size(5 * 1024 * 1024)
+                .rotation_strategy(RotationStrategy::KeepSome(3))
                 .clear_targets()
                 .targets([
                     // Console output respects RUST_LOG environment variable. In
