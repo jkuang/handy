@@ -100,6 +100,10 @@ fn request_send(app: &AppHandle) {
 }
 
 pub(crate) fn send_return(pid: i32) -> Result<(), String> {
+    post_return_events(|event| CGEvent::post_to_pid(pid, Some(event)))
+}
+
+pub(crate) fn post_return_events(mut post: impl FnMut(&CGEvent)) -> Result<(), String> {
     let down = CGEvent::new_keyboard_event(None, RETURN, true)
         .ok_or("Could not create Return key press")?;
     let up = CGEvent::new_keyboard_event(None, RETURN, false)
@@ -112,7 +116,7 @@ pub(crate) fn send_return(pid: i32) -> Result<(), String> {
             CGEventField::EventSourceUserData,
             SUBMIT_EVENT_MARKER,
         );
-        CGEvent::post_to_pid(pid, Some(event));
+        post(event);
     }
     Ok(())
 }

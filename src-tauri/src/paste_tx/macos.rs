@@ -205,6 +205,9 @@ impl MacPending {
             return;
         }
         let Some(pid) = self.after_paste.claim_return(timing, same_focus, visible) else {
+            if timing == SubmitTiming::VerifiedEdit {
+                debug!("[finish-and-send] edit check inconclusive or focus changed");
+            }
             return;
         };
         match crate::shortcut::finish_and_send::send_return(pid) {
@@ -298,11 +301,44 @@ fn flush_pending(app_handle: &AppHandle, enigo: &mut enigo::Enigo) {
     }
 }
 
-fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle, mut check_edit: bool) {
+const POLL_INTERVAL: Duration = Duration::from_millis(15);
+
+// Some editors read before inserting. Give them one more chance to confirm
+// the edit without continuously querying the frontmost app via Accessibility.
+enum EditCheck {
+    AfterReceipt,
+    RetryAt(Instant),
+    Done,
+}
+
+impl EditCheck {
+    fn new(available: bool) -> Self {
+        if available {
+            Self::AfterReceipt
+        } else {
+            Self::Done
+        }
+    }
+
+    fn due(&mut self, now: Instant, eligible: bool) -> bool {
+        if !eligible {
+            return false;
+        }
+        match self {
+            Self::AfterReceipt => *self = Self::RetryAt(now + Duration::from_millis(75)),
+            Self::RetryAt(at) if now >= *at => *self = Self::Done,
+            _ => return false,
+        }
+        true
+    }
+}
+
+fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle, check_edit: bool) {
     thread::spawn(move || {
+        let mut edit_check = EditCheck::new(check_edit);
         let outcome = loop {
-            thread::sleep(Duration::from_millis(15));
-            let (decision, state_snapshot) = {
+            thread::sleep(POLL_INTERVAL);
+            let (decision, state_snapshot, check_now) = {
                 let p = match pending.lock() {
                     Ok(p) => p,
                     Err(_) => return,
@@ -319,7 +355,9 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle, mut chec
                             st.ownership_lost,
                             st.injection_failed,
                         );
-                        (evaluate(&st, now), snapshot)
+                        let eligible = matches!(p.after_paste, AfterPaste::FinishAndSend(_))
+                            && submit_receipt(&st).is_some();
+                        (evaluate(&st, now), snapshot, edit_check.due(now, eligible))
                     }
                     Err(_) => return,
                 };
@@ -328,10 +366,7 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle, mut chec
             if let WaitDecision::Finish = decision {
                 break state_snapshot;
             }
-            // One opportunity after the first receipt. Slow editors and fields
-            // that transform the paste continue through normal settlement.
-            if check_edit && state_snapshot == (true, false, false) {
-                check_edit = false;
+            if check_now {
                 let pending = pending.clone();
                 let app = app_handle.clone();
                 let _ = app_handle.run_on_main_thread(move || {
@@ -414,7 +449,13 @@ pub(crate) fn run(
 
     let edit = match (&after_paste, MainThreadMarker::new()) {
         (AfterPaste::FinishAndSend(target), Some(main)) => {
-            ExpectedEdit::capture(target.pid, text).map(|edit| MainThreadBound::new(edit, main))
+            match ExpectedEdit::capture(target.pid, text) {
+                Ok(edit) => Some(MainThreadBound::new(edit, main)),
+                Err(reason) => {
+                    debug!("[finish-and-send] using settlement: {reason}");
+                    None
+                }
+            }
         }
         _ => None,
     };
@@ -490,6 +531,21 @@ mod tests {
             session: 1,
             cancel_generation: 0,
         })
+    }
+
+    #[test]
+    fn probes_only_after_a_receipt_and_retries_once() {
+        let start = Instant::now();
+        let mut unavailable = EditCheck::new(false);
+        assert!(!unavailable.due(start, true));
+        let mut probe = EditCheck::new(true);
+        assert!(!probe.due(start, false));
+        assert!(probe.due(start, true));
+        assert!(!probe.due(start + POLL_INTERVAL, true));
+        let later = start + Duration::from_millis(100);
+        assert!(!probe.due(later, false));
+        assert!(probe.due(later, true));
+        assert!(!probe.due(later + Duration::from_secs(1), true));
     }
 
     #[test]

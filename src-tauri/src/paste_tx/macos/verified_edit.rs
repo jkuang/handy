@@ -133,14 +133,29 @@ pub(super) struct ExpectedEdit {
 }
 
 impl ExpectedEdit {
-    pub(super) fn capture(pid: i32, text: &str) -> Option<Self> {
+    pub(super) fn capture(pid: i32, text: &str) -> Result<Self, &'static str> {
         // SAFETY: Create returns an owned application AXUIElement.
-        let app = unsafe { CFRetained::from_raw(NonNull::new(AXUIElementCreateApplication(pid))?) };
+        let app = unsafe {
+            CFRetained::from_raw(
+                NonNull::new(AXUIElementCreateApplication(pid)).ok_or("no application")?,
+            )
+        };
         if unsafe { AXUIElementSetMessagingTimeout(&app, AX_TIMEOUT_SECONDS) } != 0 {
-            return None;
+            return Err("AX messaging unavailable");
         }
-        let field = focused_element(&app)?;
-        let before = EditorState::read(&field)?;
+        let field = focused_element(&app).ok_or("no accessible focused field")?;
+        let before =
+            EditorState::read(&field).ok_or("unsupported field or unavailable attributes")?;
+        Self::from_editor(app, field, before, text)
+            .ok_or("ambiguous replacement or invalid selection")
+    }
+
+    fn from_editor(
+        app: CFRetained<CFType>,
+        field: CFRetained<CFType>,
+        before: EditorState,
+        text: &str,
+    ) -> Option<Self> {
         let text = CFString::from_str(text);
         let after = before.after_paste(text.length())?;
         let range = CFRange::new(before.selection.location, text.length());
@@ -320,3 +335,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod benchmark;
