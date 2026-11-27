@@ -207,11 +207,7 @@ pub(crate) fn try_reliable_paste(
         paste_method,
         enigo,
         clipboard_handling,
-        if auto_submit {
-            macos::AfterPaste::AutoSubmit(auto_submit_key)
-        } else {
-            macos::AfterPaste::None
-        },
+        auto_submit.then_some(auto_submit_key),
     );
 
     #[cfg(target_os = "windows")]
