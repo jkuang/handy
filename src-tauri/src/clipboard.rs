@@ -16,12 +16,12 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use crate::utils::{is_gnome_wayland, is_kde_wayland, is_wayland};
 
 /// Serializes pastes: overlapping ones would restore each other's transcript as
-/// the user's clipboard. Only taken by `paste`, which never runs on the main thread.
+/// the user's clipboard. Both paste entry points take this on a worker thread.
 static PASTE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Runs `f` with the shared Enigo on the main thread (macOS TIS APIs require it)
 /// and waits for the result. Runs inline if already on the main thread, so no deadlock.
-fn with_enigo<T: Send + 'static>(
+pub(crate) fn with_enigo<T: Send + 'static>(
     app_handle: &AppHandle,
     f: impl FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
@@ -932,19 +932,7 @@ pub(crate) fn paste_and_send(
         return Err("Finish and send requires pasting to be enabled".into());
     }
     let text = with_trailing_space(text, settings.append_trailing_space);
-    let app = app_handle.clone();
-    // A clipboard receipt is required before sending Return. The explicit
-    // shortcut always uses the standard macOS paste chord for this reason.
-    with_enigo(&app_handle, move |enigo| {
-        crate::paste_tx::macos::run(
-            &text,
-            &app,
-            &PasteMethod::CtrlV,
-            enigo,
-            settings.clipboard_handling,
-            crate::paste_tx::macos::AfterPaste::FinishAndSend(target),
-        )
-    })?;
+    crate::paste_tx::macos::run_and_send(text, &app_handle, settings.clipboard_handling, target)?;
     Ok(PasteOutcome::Pasted)
 }
 
