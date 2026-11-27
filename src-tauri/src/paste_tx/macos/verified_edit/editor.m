@@ -7,6 +7,7 @@
 @interface FixturePasteboard : NSObject
 @property(copy) NSString *text;
 @property NSUInteger reads;
+@property BOOL promised;
 @end
 @implementation FixturePasteboard
 - (NSArray *)types { return @[NSPasteboardTypeString]; }
@@ -14,6 +15,16 @@
     self.reads++;
     puts("READ");
     fflush(stdout);
+    if (self.promised) {
+        // Wait inside the native read for the provider to reply to READ.
+        char *line = NULL;
+        size_t capacity = 0;
+        ssize_t size = getline(&line, &capacity, stdin);
+        if (size <= 0) abort();
+        NSData *data = [NSData dataWithBytes:line length:(NSUInteger)size];
+        self.text = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:NULL];
+        free(line);
+    }
     return @[self.text];
 }
 @end
@@ -45,6 +56,7 @@ static id command(NSDictionary *request, Receiver *editor, FixturePasteboard *bo
         editor.selectedRange = NSMakeRange([request[@"start"] unsignedIntegerValue],
                                            [request[@"length"] unsignedIntegerValue]);
         board.text = request[@"text"];
+        board.promised = [request[@"promised"] boolValue];
         editor.supportsLength = [request[@"supportsLength"] boolValue];
         board.reads = editor.downs = editor.ups = 0;
         editor.atReturn = @"";

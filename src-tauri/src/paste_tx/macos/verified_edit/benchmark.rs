@@ -8,7 +8,7 @@ use objc2_core_graphics::CGEvent;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 struct Editor {
@@ -46,10 +46,14 @@ impl Editor {
     }
 
     fn request(&mut self, message: Value) -> Value {
-        self.request_with_receipts(message, || panic!("unexpected pasteboard read"))
+        self.request_with_receipts(message, |_| panic!("unexpected pasteboard read"))
     }
 
-    fn request_with_receipts(&mut self, message: Value, mut receipt: impl FnMut()) -> Value {
+    fn request_with_receipts(
+        &mut self,
+        message: Value,
+        mut receipt: impl FnMut(&mut ChildStdin),
+    ) -> Value {
         let input = self.process.stdin.as_mut().unwrap();
         writeln!(input, "{message}").unwrap();
         input.flush().unwrap();
@@ -61,7 +65,7 @@ impl Editor {
                 "editor exited on {message}"
             );
             if reply.trim_end() == "READ" {
-                receipt();
+                receipt(input);
             } else {
                 return serde_json::from_str(&reply).unwrap();
             }
@@ -140,7 +144,7 @@ fn trial(editor: &RefCell<Editor>, case: Case, enabled: bool, round: usize) -> (
     let first = if delayed { "read" } else { "paste" };
     editor
         .borrow_mut()
-        .request_with_receipts(json!({"op":first}), || tx.record_receipt(Instant::now()));
+        .request_with_receipts(json!({"op":first}), |_| tx.record_receipt(Instant::now()));
     let first_read = tx
         .last_receipt_after_injection()
         .expect("AppKit read the promised text");
@@ -165,7 +169,7 @@ fn trial(editor: &RefCell<Editor>, case: Case, enabled: bool, round: usize) -> (
             };
             editor
                 .borrow_mut()
-                .request_with_receipts(json!({"op":op}), || tx.record_receipt(Instant::now()));
+                .request_with_receipts(json!({"op":op}), |_| tx.record_receipt(Instant::now()));
             assert_eq!(
                 tx.receipts.len(),
                 if matches!(case, Case::RepeatedRead) {
@@ -253,5 +257,88 @@ fn benchmark_return_to_send() {
         }
         let median = |v: &[f64]| (v[14] + v[15]) / 2.0;
         println!("{case:?}: {PAIRS} pairs, old p50/p95 {:.1}/{:.1} ms, new {:.1}/{:.1} ms, median paired saving {:.1} ms, early {early}/{PAIRS}", median(&old), old[28], median(&new), new[28], median(&savings));
+    }
+}
+
+/// Measure pasteboard callback and Return delivery independently. The native
+/// editor blocks inside its pasteboard read until the provider supplies text.
+/// A serial dispatch queue stands in for Handy's main thread, and the OS
+/// clipboard and global keyboard are untouched.
+#[test]
+#[ignore = "macOS AppKit clipboard-provider timing benchmark"]
+fn benchmark_command_hold() {
+    use crate::paste_tx::macos::wait_for_command_release;
+    use dispatch2::DispatchQueue;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut editor = Editor::start(dir.path());
+    let ui = DispatchQueue::new("handy.test.pasteboard-provider", None);
+    for request_ms in [5, 150] {
+        let mut results = [Vec::new(), Vec::new()];
+        for round in 0..20 {
+            for worker in [round % 2 == 0, round % 2 != 0] {
+                let transcript = format!("dictation {round} 🦊");
+                editor.request(
+                    json!({"op":"begin","draft":"old draft","start":0,"length":9,
+                    "supportsLength":false,"promised":true}),
+                );
+                let mut tx = TxState::new();
+                let started = Instant::now();
+                tx.injected_at = Some(started);
+
+                let (release_tx, release_rx) = mpsc::channel();
+                let hold = move || {
+                    wait_for_command_release(started);
+                    release_tx.send(Instant::now()).unwrap();
+                };
+                if worker {
+                    thread::spawn(hold);
+                } else {
+                    ui.exec_async(hold);
+                }
+                thread::sleep(Duration::from_millis(request_ms));
+                editor.request_with_receipts(json!({"op":"paste"}), |input| {
+                    ui.exec_sync(|| {
+                        tx.record_receipt(Instant::now());
+                        writeln!(input, "{}", json!(transcript)).unwrap();
+                        input.flush().unwrap();
+                    });
+                });
+                assert_eq!(tx.receipts.len(), 1);
+                let receipt = tx.receipts[0];
+                let released = release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(released.duration_since(started) >= Duration::from_millis(CHORD_HOLD_MS));
+                // Like the production waiter, dispatch Return only after key-up
+                // and the ordinary settlement decision for an unverified field.
+                let mut poll = released + POLL_INTERVAL;
+                loop {
+                    thread::sleep(poll.saturating_duration_since(Instant::now()));
+                    let now = Instant::now();
+                    if matches!(evaluate(&tx, now), WaitDecision::Finish) {
+                        break;
+                    }
+                    poll = now + POLL_INTERVAL;
+                }
+                editor.send_return();
+                let result = editor.request(json!({"op":"result"}));
+                assert_eq!(result["text"], transcript);
+                assert_eq!(result["downs"], 1);
+                assert_eq!(result["ups"], 1);
+                results[usize::from(worker)].push((
+                    receipt.duration_since(started).as_secs_f64() * 1000.0,
+                    result["ms"].as_f64().unwrap(),
+                ));
+            }
+        }
+        for (label, samples) in ["main-thread hold", "worker hold"].into_iter().zip(results) {
+            let (mut reads, mut returns): (Vec<_>, Vec<_>) = samples.into_iter().unzip();
+            reads.sort_by(f64::total_cmp);
+            returns.sort_by(f64::total_cmp);
+            let median = |s: &[f64]| (s[9] + s[10]) / 2.0;
+            println!("Request at +{request_ms} ms, {label} (20 trials): callback median/p95 {:.1}/{:.1} ms; Return median/p95 {:.1}/{:.1} ms",
+                median(&reads), reads[18], median(&returns), returns[18]);
+        }
     }
 }

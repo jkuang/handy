@@ -7,10 +7,9 @@
 //! restored once receipts go quiet (see `paste_tx::evaluate`), guarded by the
 //! pasteboard `changeCount` so we never clobber a newer user copy.
 //!
-//! Threading: publishing and chord injection happen on the calling (main)
-//! thread, because promised pasteboard data is serviced by AppKit on the main
-//! run loop. The (potentially seconds-long) wait runs on a worker thread; the
-//! guarded restore is dispatched back to the main thread.
+//! AppKit serves the pasteboard promise on the main run loop. For explicit
+//! Return-to-send, we resolve the layout and post Cmd+V there, then release
+//! Command on the paste worker. AppKit can supply text while Command is down.
 
 mod verified_edit;
 
@@ -28,9 +27,9 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use self::verified_edit::ExpectedEdit;
-use super::{evaluate, send_chord, TxState, WaitDecision};
-use crate::clipboard::send_return_key;
-use crate::input::EnigoState;
+use super::{evaluate, send_chord, TxState, WaitDecision, CHORD_HOLD_MS};
+use crate::clipboard::{send_return_key, with_enigo};
+use crate::input::{press_paste_ctrl_v, release_paste_modifier, EnigoState};
 use crate::settings::{AutoSubmitKey, ClipboardHandling, PasteMethod};
 
 /// Concealment marker types declared alongside the text so that well-behaved
@@ -113,7 +112,7 @@ impl SendTarget {
     }
 }
 
-pub(crate) enum AfterPaste {
+enum AfterPaste {
     None,
     AutoSubmit(AutoSubmitKey),
     FinishAndSend(SendTarget),
@@ -407,20 +406,78 @@ fn spawn_waiter(pending: Arc<Mutex<MacPending>>, app_handle: AppHandle, check_ed
     });
 }
 
+/// Runs on the paste worker, which holds PASTE_LOCK through modifier release.
+/// The main thread is free to serve a pasteboard request during the hold.
+pub(crate) fn run_and_send(
+    text: String,
+    app: &AppHandle,
+    clipboard_handling: ClipboardHandling,
+    target: SendTarget,
+) -> Result<(), String> {
+    let keyboard = app
+        .try_state::<EnigoState>()
+        .ok_or("Enigo state not initialized")?;
+    let main_app = app.clone();
+    let (pending, pressed) = with_enigo(app, move |enigo| {
+        let pending = publish(
+            &text,
+            &main_app,
+            enigo,
+            clipboard_handling,
+            AfterPaste::FinishAndSend(target),
+        )?;
+        let pressed = press_paste_ctrl_v(enigo).map(|modifier| (modifier, Instant::now()));
+        Ok((pending, pressed))
+    })?;
+    let injection = pressed.and_then(|(modifier, held_since)| {
+        wait_for_command_release(held_since);
+        // Releasing a known modifier only posts a Quartz key-up. It does
+        // not use Carbon's main-thread-only keyboard layout APIs.
+        let mut enigo = keyboard
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        release_paste_modifier(&mut enigo, modifier)
+    });
+    // The waiter can only post Return after the key-up succeeded. A failed
+    // chord still needs its clipboard restored.
+    finish_injection(pending, app, &PasteMethod::CtrlV, injection)
+}
+
+fn wait_for_command_release(held_since: Instant) {
+    let remaining = Duration::from_millis(CHORD_HOLD_MS).saturating_sub(held_since.elapsed());
+    thread::sleep(remaining);
+}
+
 pub(crate) fn run(
     text: &str,
     app_handle: &AppHandle,
     paste_method: &PasteMethod,
     enigo: &mut enigo::Enigo,
     clipboard_handling: ClipboardHandling,
-    after_paste: AfterPaste,
+    auto_submit: Option<AutoSubmitKey>,
 ) -> Result<(), String> {
+    let after_paste = auto_submit.map_or(AfterPaste::None, AfterPaste::AutoSubmit);
+    let pending = publish(text, app_handle, enigo, clipboard_handling, after_paste)?;
+    let injection = send_chord(enigo, paste_method);
+    // Once published, ordinary reliable paste owns restoration. A chord
+    // error here must not make the caller attempt a second legacy paste.
+    let _ = finish_injection(pending, app_handle, paste_method, injection);
+    Ok(())
+}
+
+fn publish(
+    text: &str,
+    app_handle: &AppHandle,
+    enigo: &mut enigo::Enigo,
+    clipboard_handling: ClipboardHandling,
+    after_paste: AfterPaste,
+) -> Result<MacPending, String> {
     if let AfterPaste::FinishAndSend(target) = &after_paste {
         if !target.is_current(app_handle) {
             return Err("The app that requested finish and send is no longer focused".into());
         }
     }
-    let explicit_send = matches!(after_paste, AfterPaste::FinishAndSend(_));
 
     // Settle any previous transaction first so the snapshot below captures the
     // user's original clipboard, not the previous transcript.
@@ -475,28 +532,7 @@ pub(crate) fn run(
     }
     info!("[reliable-paste] published transcript as lazy promise (changeCount {change_count})");
 
-    // Mark injection *before* sending: enigo holds the chord for ~100ms and a
-    // fast target may legitimately read while the chord is still held.
-    if let Ok(mut st) = state.lock() {
-        st.injected_at = Some(Instant::now());
-    }
-    let injection = send_chord(enigo, paste_method);
-    match &injection {
-        Ok(()) => {
-            info!("[reliable-paste] paste chord sent ({paste_method:?})");
-        }
-        Err(e) => {
-            // Keep the transaction alive: the waiter restores the clipboard
-            // after the short failed-injection timeout.
-            if let Ok(mut st) = state.lock() {
-                st.injection_failed = true;
-            }
-            error!("[reliable-paste] failed to send paste chord: {e}");
-        }
-    }
-
-    let check_edit = edit.is_some();
-    let pending = Arc::new(Mutex::new(MacPending {
+    let pending = MacPending {
         state,
         saved_text,
         saved_image,
@@ -507,17 +543,43 @@ pub(crate) fn run(
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
         transcript: text.to_string(),
         settled: false,
-    }));
+    };
+    // Both callers post the chord in this same main-thread closure. A read
+    // occurring during the modifier hold is legitimate.
+    if let Ok(mut state) = pending.state.lock() {
+        state.injected_at = Some(Instant::now());
+    }
+    Ok(pending)
+}
+
+fn finish_injection(
+    pending: MacPending,
+    app_handle: &AppHandle,
+    paste_method: &PasteMethod,
+    injection: Result<(), String>,
+) -> Result<(), String> {
+    match &injection {
+        Ok(()) => {
+            info!("[reliable-paste] paste chord sent ({paste_method:?})");
+        }
+        Err(e) => {
+            // Keep the transaction alive: the waiter restores the clipboard
+            // after the short failed-injection timeout.
+            if let Ok(mut st) = pending.state.lock() {
+                st.injection_failed = true;
+            }
+            error!("[reliable-paste] failed to send paste chord: {e}");
+        }
+    }
+
+    let check_edit = pending.edit.is_some();
+    let pending = Arc::new(Mutex::new(pending));
     if let Ok(mut slot) = PENDING.lock() {
         *slot = Some(pending.clone());
     }
     spawn_waiter(pending, app_handle.clone(), check_edit);
 
-    if explicit_send {
-        injection
-    } else {
-        Ok(())
-    }
+    injection
 }
 
 #[cfg(test)]
