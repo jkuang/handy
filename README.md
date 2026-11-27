@@ -1,10 +1,12 @@
 # Handy
 
-This fork adds three improvements to Handy on macOS.
+This fork improves dictation on macOS.
 
-- **Return-to-send** finishes dictation, pastes the transcript, and presses Return in the app you were dictating into. The recording overlay uses a teal accent.
-- **Shorter start chime** plays a 185 ms version of the macOS Dictation cue.
-- The macOS installer waits for Handy to quit, verifies the new app, and saves the previous bundle for rollback.
+- `feat` **Return-to-send.** Press Return or keypad Enter while recording to finish dictation. Handy pastes the transcript into the app you were dictating into, then presses Return there. The recording overlay uses a teal accent.
+- `perf` **Shorter start chime.** The default chime plays a 185 ms version of the macOS Dictation cue. If you mute system audio during dictation, muting starts as soon as the chime ends.
+- `perf` **Faster paste and Return.** The app can read the transcript while Handy is still holding Command for ⌘V. If Handy can confirm the pasted text in the focused field, it sends Return early. Otherwise, it waits for 200 ms after the last clipboard read.
+- `fix` **Reliable Right Option shortcut.** If Handy misses a Command release after a paste, the next Right Option press can start dictation without an extra keystroke or click.
+- `feat` **Installer rollback.** The macOS installer verifies the new app, waits for Handy to quit, and saves the previous app bundle so you can roll back.
 
 ## Quick start for this fork
 
